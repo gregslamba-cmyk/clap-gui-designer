@@ -1,0 +1,15 @@
+[package]
+name = "greg_gui_core"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default-features = false, features = ["vst3"] }
+vizia = "0.7"
+baseview = "0.7"
+futures = "1"
+lockfree = "1.3"
