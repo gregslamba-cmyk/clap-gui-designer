@@ -9,6 +9,12 @@ use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
+/// Re-export vizia types for downstream plugins to avoid version conflicts.
+pub mod prelude {
+    pub use nih_plug_vizia::vizia::prelude::*;
+    pub use nih_plug_vizia::widgets::ParamSlider;
+}
+
 /// Numero massimo di canali simultanei supportati nei meter multicanale SX/DX.
 pub const MAX_GUI_CHANNELS: usize = 16;
 
