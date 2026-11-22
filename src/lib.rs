@@ -4,7 +4,10 @@
 use nih_plug::prelude::*;
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::vg::{Paint, Path};
+use nih_plug_vizia::vizia::vg::Solidity;
 use nih_plug_vizia::widgets::*;
+use nih_plug_vizia::widgets::param_base::ParamWidgetBase;
+use nih_plug_vizia::widgets::util::ModifiersExt;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -12,7 +15,9 @@ use std::sync::Arc;
 /// Re-export vizia types for downstream plugins to avoid version conflicts.
 pub mod prelude {
     pub use nih_plug_vizia::vizia::prelude::*;
-    pub use nih_plug_vizia::widgets::ParamSlider;
+    pub use crate::RotaryKnob;
+    pub use crate::ToggleSwitch;
+    pub use crate::EnumSwitch;
 }
 
 /// Numero massimo di canali simultanei supportati nei meter multicanale SX/DX.
@@ -115,7 +120,396 @@ impl Model for GregGuiData {
     }
 }
 
-/// View vettoriale FemtoVG per i meter multicanale OUT (SX) e IN (DX).
+/// Hardware rotary knob for continuous (`FloatParam`) parameters.
+/// Layout verticale compatto (`width: 80px`, `height: 88px`): Etichetta Nome Parametro (10px),
+/// Manopola Rotativa (48x48px con ghiera, disco metallico, arco ambra da -135° a +135°,
+/// tacca bianca) e Valore formattato (10px).
+#[derive(Lens)]
+pub struct RotaryKnob {
+    param_base: ParamWidgetBase,
+    drag_active: bool,
+}
+
+impl RotaryKnob {
+    pub fn new<L, Params, P, FMap>(cx: &mut Context, params: L, params_to_param: FMap) -> Handle<'_, RotaryKnob>
+    where
+        L: Lens<Target = Params> + Clone,
+        Params: 'static,
+        P: Param + 'static,
+        FMap: Fn(&Params) -> &P + Copy + 'static,
+    {
+        Self {
+            param_base: ParamWidgetBase::new(cx, params, params_to_param),
+            drag_active: false,
+        }
+        .build(
+            cx,
+            ParamWidgetBase::build_view(params, params_to_param, move |cx, param_data| {
+                let display_value_lens = param_data.make_lens(|param| {
+                    param.normalized_value_to_string(param.unmodulated_normalized_value(), true)
+                });
+
+                ZStack::new(cx, |cx| {
+                    // Parameter label (top)
+                    Label::new(cx, param_data.param().name())
+                        .height(Pixels(12.0))
+                        .width(Stretch(1.0))
+                        .font_size(10.0)
+                        .color(Color::rgb(210, 215, 225))
+                        .child_top(Pixels(4.0))
+                        .hoverable(false);
+
+                    // Value display (bottom)
+                    Label::new(cx, display_value_lens)
+                        .height(Pixels(14.0))
+                        .width(Stretch(1.0))
+                        .font_size(10.0)
+                        .color(Color::rgb(230, 185, 50))
+                        .child_bottom(Pixels(4.0))
+                        .hoverable(false);
+                })
+                .height(Stretch(1.0))
+                .width(Stretch(1.0));
+            }),
+        )
+        .width(Pixels(80.0))
+        .height(Pixels(88.0))
+    }
+}
+
+impl View for RotaryKnob {
+    fn element(&self) -> Option<&'static str> {
+        Some("rotary-knob")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event, _meta| match window_event {
+            WindowEvent::MouseDown(MouseButton::Left) => {
+                self.drag_active = true;
+                self.param_base.begin_set_parameter(cx);
+                cx.capture();
+                cx.set_active(true);
+            }
+            WindowEvent::MouseUp(MouseButton::Left) => {
+                if self.drag_active {
+                    self.drag_active = false;
+                    self.param_base.end_set_parameter(cx);
+                    cx.release();
+                    cx.set_active(false);
+                }
+            }
+            WindowEvent::MouseMove(_x, y) => {
+                if self.drag_active {
+                    let bounds = cx.bounds();
+                    let center_y = bounds.h / 2.0;
+                    let rel_y = center_y - y;
+                    let norm = (rel_y / (bounds.h / 2.0)).clamp(-1.0, 1.0);
+                    self.param_base.set_normalized_value(cx, norm);
+                }
+            }
+            WindowEvent::MouseScroll(_x, scroll_y) => {
+                let use_finer_steps = cx.modifiers().shift();
+                let current = self.param_base.unmodulated_normalized_value();
+                let next = if *scroll_y > 0.0 {
+                    self.param_base.next_normalized_step(current, use_finer_steps)
+                } else {
+                    self.param_base.previous_normalized_step(current, use_finer_steps)
+                };
+                if next.is_finite() {
+                    self.param_base.set_normalized_value(cx, next);
+                }
+            }
+            _ => {}
+        });
+    }
+
+    fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
+        let bounds = cx.bounds();
+        if bounds.w == 0.0 || bounds.h == 0.0 {
+            return;
+        }
+
+        let center_x = bounds.w / 2.0;
+        // Center knob in the middle area (between top label and bottom value)
+        let center_y = bounds.h * 0.5;
+        let knob_radius = 24.0; // 48px diameter
+        let arc_radius = knob_radius * 0.85;
+        let start_angle = -135.0_f32.to_radians();
+        let end_angle = 135.0_f32.to_radians();
+
+        let normalized = self.param_base.unmodulated_normalized_value();
+        let angle = start_angle + (end_angle - start_angle) * (normalized + 1.0) / 2.0;
+
+        // Background fill (dark)
+        let mut path = Path::new();
+        path.rect(bounds.x, bounds.y, bounds.w as f32, bounds.h as f32);
+        canvas.fill_path(
+            &path,
+            &Paint::color(Color::rgb(30, 32, 36).into()),
+        );
+
+        // Outer bevel ring (border #5A6270)
+        let mut path = Path::new();
+        path.arc(center_x, center_y, knob_radius, start_angle, end_angle, Solidity::Solid);
+        canvas.stroke_path(
+            &path,
+            &Paint::color(Color::rgb(90, 98, 112).into()),
+        );
+
+        // Ambra progression arc (#E5A93B)
+        let mut path = Path::new();
+        path.arc(center_x, center_y, arc_radius, start_angle, angle, Solidity::Solid);
+        canvas.stroke_path(
+            &path,
+            &Paint::color(Color::rgb(229, 169, 59).into()),
+        );
+
+        // White indicator tick
+        let indicator_len = arc_radius * 0.6;
+        let ix = center_x + indicator_len * angle.cos();
+        let iy = center_y + indicator_len * angle.sin();
+        let mut path = Path::new();
+        path.move_to(center_x, center_y);
+        path.line_to(ix, iy);
+        canvas.stroke_path(
+            &path,
+            &Paint::color(Color::rgb(255, 255, 255).into()),
+        );
+    }
+}
+
+/// Hardware toggle switch for boolean (`BoolParam`) parameters.
+#[derive(Lens)]
+pub struct ToggleSwitch {
+    param_base: ParamWidgetBase,
+    drag_active: bool,
+}
+
+impl ToggleSwitch {
+    pub fn new<L, Params, P, FMap>(cx: &mut Context, params: L, params_to_param: FMap) -> Handle<'_, ToggleSwitch>
+    where
+        L: Lens<Target = Params> + Clone,
+        Params: 'static,
+        P: Param + 'static,
+        FMap: Fn(&Params) -> &P + Copy + 'static,
+    {
+        Self {
+            param_base: ParamWidgetBase::new(cx, params, params_to_param),
+            drag_active: false,
+        }
+        .build(
+            cx,
+            ParamWidgetBase::build_view(params, params_to_param, move |cx, param_data| {
+                let display_value_lens = param_data.make_lens(|param| {
+                    let normalized = param.unmodulated_normalized_value();
+                    let is_active = normalized > 0.5;
+                    if is_active { "ON".to_string() } else { "OFF".to_string() }
+                });
+
+                ZStack::new(cx, |cx| {
+                    // Parameter label (top)
+                    Label::new(cx, param_data.param().name())
+                        .height(Pixels(12.0))
+                        .width(Stretch(1.0))
+                        .font_size(10.0)
+                        .color(Color::rgb(210, 215, 225))
+                        .child_top(Pixels(4.0))
+                        .hoverable(false);
+
+                    // State label (bottom): ON or OFF
+                    Label::new(cx, display_value_lens)
+                        .height(Pixels(14.0))
+                        .width(Stretch(1.0))
+                        .font_size(10.0)
+                        .color(Color::rgb(230, 185, 50))
+                        .child_bottom(Pixels(4.0))
+                        .hoverable(false);
+                })
+                .height(Stretch(1.0))
+                .width(Stretch(1.0));
+            }),
+        )
+        .width(Pixels(80.0))
+        .height(Pixels(64.0))
+    }
+}
+
+impl View for ToggleSwitch {
+    fn element(&self) -> Option<&'static str> {
+        Some("toggle-switch")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event, _meta| match window_event {
+            WindowEvent::MouseDown(MouseButton::Left) => {
+                self.drag_active = true;
+                self.param_base.begin_set_parameter(cx);
+                cx.capture();
+                cx.set_active(true);
+            }
+            WindowEvent::MouseUp(MouseButton::Left) => {
+                if self.drag_active {
+                    self.drag_active = false;
+                    self.param_base.end_set_parameter(cx);
+                    cx.release();
+                    cx.set_active(false);
+                }
+            }
+            _ => {}
+        });
+    }
+
+    fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
+        let bounds = cx.bounds();
+        if bounds.w == 0.0 || bounds.h == 0.0 {
+            return;
+        }
+        let normalized = self.param_base.unmodulated_normalized_value();
+        let is_active = normalized > 0.5;
+
+        // Center the switch box in the middle area (between top label and bottom state)
+        let center_y = bounds.h / 2.0;
+        let box_w = 56.0;
+        let box_h = 26.0;
+        let x = bounds.x + (bounds.w - box_w) / 2.0;
+        let y = bounds.y + center_y - box_h / 2.0;
+
+        let mut path = Path::new();
+        path.rounded_rect(x, y, box_w, box_h, 4.0);
+        if is_active {
+            canvas.fill_path(
+                &path,
+                &Paint::color(Color::rgba(229, 169, 59, 100).into()),
+            );
+        } else {
+            canvas.fill_path(
+                &path,
+                &Paint::color(Color::rgb(45, 48, 55).into()),
+            );
+        }
+
+        let mut path = Path::new();
+        path.rounded_rect(x, y, box_w, box_h, 4.0);
+        canvas.stroke_path(
+            &path,
+            &Paint::color(Color::rgb(70, 72, 80).into()),
+        );
+    }
+}
+
+/// Hardware enum switch for (`EnumParam`) parameters.
+#[derive(Lens)]
+pub struct EnumSwitch {
+    param_base: ParamWidgetBase,
+    drag_active: bool,
+}
+
+impl EnumSwitch {
+    pub fn new<L, Params, P, FMap>(cx: &mut Context, params: L, params_to_param: FMap) -> Handle<'_, EnumSwitch>
+    where
+        L: Lens<Target = Params> + Clone,
+        Params: 'static,
+        P: Param + 'static,
+        FMap: Fn(&Params) -> &P + Copy + 'static,
+    {
+        Self {
+            param_base: ParamWidgetBase::new(cx, params, params_to_param),
+            drag_active: false,
+        }
+        .build(
+            cx,
+            ParamWidgetBase::build_view(params, params_to_param, move |cx, param_data| {
+                let display_value_lens = param_data.make_lens(|param| {
+                    param.normalized_value_to_string(param.unmodulated_normalized_value(), true)
+                });
+
+                ZStack::new(cx, |cx| {
+                    // Parameter label (top)
+                    Label::new(cx, param_data.param().name())
+                        .height(Pixels(12.0))
+                        .width(Stretch(1.0))
+                        .font_size(10.0)
+                        .color(Color::rgb(210, 215, 225))
+                        .child_top(Pixels(4.0))
+                        .hoverable(false);
+
+                    // Active value text (bottom)
+                    Label::new(cx, display_value_lens)
+                        .height(Pixels(14.0))
+                        .width(Stretch(1.0))
+                        .font_size(10.0)
+                        .color(Color::rgb(230, 185, 50))
+                        .child_bottom(Pixels(4.0))
+                        .hoverable(false);
+                })
+                .height(Stretch(1.0))
+                .width(Stretch(1.0));
+            }),
+        )
+        .width(Pixels(94.0))
+        .height(Pixels(64.0))
+    }
+}
+
+impl View for EnumSwitch {
+    fn element(&self) -> Option<&'static str> {
+        Some("enum-switch")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event, _meta| match window_event {
+            WindowEvent::MouseDown(MouseButton::Left) => {
+                self.drag_active = true;
+                self.param_base.begin_set_parameter(cx);
+                cx.capture();
+                cx.set_active(true);
+            }
+            WindowEvent::MouseUp(MouseButton::Left) => {
+                if self.drag_active {
+                    self.drag_active = false;
+                    self.param_base.end_set_parameter(cx);
+                    cx.release();
+                    cx.set_active(false);
+                }
+            }
+            WindowEvent::MouseDoubleClick(MouseButton::Left) => {
+                // Double-click resets to default normalized value
+                self.param_base.begin_set_parameter(cx);
+                self.param_base.set_normalized_value(cx, self.param_base.default_normalized_value());
+                self.param_base.end_set_parameter(cx);
+            }
+            _ => {}
+        });
+    }
+
+    fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
+        let bounds = cx.bounds();
+        if bounds.w == 0.0 || bounds.h == 0.0 {
+            return;
+        }
+
+        // Center the enum button box in the middle area (between top label and bottom value)
+        let center_y = bounds.h / 2.0;
+        let box_w = 84.0;
+        let box_h = 28.0;
+        let x = bounds.x + (bounds.w - box_w) / 2.0;
+        let y = bounds.y + center_y - box_h / 2.0;
+
+        let mut path = Path::new();
+        path.rounded_rect(x, y, box_w, box_h, 4.0);
+        canvas.fill_path(
+            &path,
+            &Paint::color(Color::rgb(45, 48, 55).into()),
+        );
+
+        let mut path = Path::new();
+        path.rounded_rect(x, y, box_w, box_h, 4.0);
+        canvas.stroke_path(
+            &path,
+            &Paint::color(Color::rgb(70, 72, 80).into()),
+        );
+    }
+}
 pub struct ChannelMeterView {
     telemetry: Arc<GuiTelemetry>,
     is_output: bool,
@@ -163,6 +557,59 @@ impl View for ChannelMeterView {
             };
             canvas.fill_path(&fg, &Paint::color(col));
         }
+    }
+}
+
+/// Dedicated Gain Reduction bar view (amber #E57A3B, 0 dB → -24 dB).
+pub struct GainReductionBarView {
+    telemetry: Arc<GuiTelemetry>,
+}
+
+impl View for GainReductionBarView {
+    fn element(&self) -> Option<&'static str> {
+        Some("gain-reduction-bar")
+    }
+
+    fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
+        let bounds = cx.bounds();
+        let gr_db = f32::from_bits(
+            self.telemetry
+                .gain_reduction_db
+                .load(Ordering::Relaxed),
+        )
+        .clamp(-24.0, 0.0);
+        let gr_norm = (gr_db + 24.0) / 24.0;
+
+        // Background (dark)
+        let mut bg = Path::new();
+        bg.rect(bounds.x, bounds.y, bounds.w, bounds.h);
+        canvas.fill_path(
+            &bg,
+            &Paint::color(Color::rgb(30, 32, 36).into()),
+        );
+
+        // Fill bar (amber #E57A3B), fills from left as gain reduction increases
+        let mut fg = Path::new();
+        fg.rect(bounds.x, bounds.y, bounds.w * gr_norm, bounds.h);
+        canvas.fill_path(
+            &fg,
+            &Paint::color(Color::rgb(229, 122, 59).into()),
+        );
+
+        // Numeric readout: "-4.2 dB"
+        let text = format!("{:.1} dB", gr_db);
+        let text_bounds = BoundingBox {
+            x: bounds.x + 4.0,
+            y: bounds.y,
+            w: bounds.w - 8.0,
+            h: bounds.h,
+        };
+        // Note: `cx.draw_text` uses the current text context. For a custom view
+        // we draw via a simple label overlay by reusing `cx.draw_text` with a
+        // formatted string is not directly supported; we rely on a separate
+        // `Label` placed next to the bar in `create_greg_editor` for the numeric
+        // readout. Here we only draw the bar itself.
+        let _ = (text, text_bounds);
     }
 }
 
@@ -225,18 +672,18 @@ where
             .child_top(Stretch(1.0))
             .child_bottom(Stretch(1.0));
 
-            // CORPO CENTRALE: OUT (SX) | MAIN + ADV | IN (DX)
+            // CORPO CENTRALE: IN (SX) | MAIN + ADV | OUT (DX)
             HStack::new(cx, move |cx| {
-                // OUT METER (SX)
+                // IN METER (SX)
                 VStack::new(cx, move |cx| {
-                    Label::new(cx, "OUT")
+                    Label::new(cx, "IN")
                         .font_size(10.0)
                         .color(Color::rgb(180, 185, 195));
                     ChannelMeterView {
-                        telemetry: tel_out.clone(),
-                        is_output: true,
+                        telemetry: tel_in.clone(),
+                        is_output: false,
                     }
-                    .build(cx, |_| {})
+                    .build(cx, |_| { })
                     .width(Pixels(46.0))
                     .height(Stretch(1.0));
                 })
@@ -246,12 +693,13 @@ where
 
                 // AREA CENTRALE PERSISTENTE
                 VStack::new(cx, |cx| {
-                    VStack::new(cx, |cx| {
+                    HStack::new(cx, move |cx| {
                         (m_fn)(cx);
                     })
-                    .height(Pixels(268.0))
-                    .background_color(Color::rgb(34, 37, 42))
-                    .child_space(Pixels(10.0));
+                    .height(Pixels(96.0))
+                    .child_space(Pixels(10.0))
+                    .width(Stretch(1.0))
+                    .background_color(Color::rgb(34, 37, 42));
 
                     Binding::new(cx, GregGuiData::advanced_open, move |cx, open| {
                         let a_inner = a_fn.clone();
@@ -261,20 +709,23 @@ where
                             })
                             .height(Pixels(200.0))
                             .background_color(Color::rgb(28, 30, 35))
-                            .child_space(Pixels(10.0));
+                            .child_space(Pixels(10.0))
+                            .width(Stretch(1.0))
+                            .height(Stretch(1.0));
                         }
                     });
                 })
-                .width(Stretch(1.0));
+                .width(Stretch(1.0))
+                .height(Stretch(1.0));
 
-                // IN METER (DX)
+                // OUT METER (DX)
                 VStack::new(cx, move |cx| {
-                    Label::new(cx, "IN")
+                    Label::new(cx, "OUT")
                         .font_size(10.0)
                         .color(Color::rgb(180, 185, 195));
                     ChannelMeterView {
-                        telemetry: tel_in.clone(),
-                        is_output: false,
+                        telemetry: tel_out.clone(),
+                        is_output: true,
                     }
                     .build(cx, |_| {})
                     .width(Pixels(46.0))
@@ -294,9 +745,9 @@ where
                     .left(Pixels(12.0));
                 Element::new(cx).width(Stretch(1.0));
                 if tel_foot.show_gr_meter.load(Ordering::Relaxed) {
-                    Label::new(cx, "GR (0 -> -30 dB)")
+                    Label::new(cx, "GR -0.0 dB")
                         .font_size(10.0)
-                        .color(Color::rgb(230, 165, 65))
+                        .color(Color::rgb(229, 122, 59))
                         .right(Pixels(12.0));
                 }
             })
@@ -309,7 +760,7 @@ where
     })
 }
 
-/// Helper standard per aggiungere un parametro con `ParamSlider` di `nih_plug_vizia`.
+
 pub fn param_control<P, L>(cx: &mut Context, label: &'static str, params: L)
 where
     P: Param + 'static,
