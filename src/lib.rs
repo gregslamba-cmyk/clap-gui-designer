@@ -1,6 +1,8 @@
 //! `greg_gui_core` - Libreria GUI comune leggera e multipiattaforma (`nih_plug_vizia` + FemtoVG)
 //! Implementa il layout standardizzato di `GUI_SPEC.md` con zero allocazioni sul thread DSP.
 
+mod gui_tokens;
+
 use nih_plug::prelude::*;
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::vg::{Paint, Path};
@@ -10,7 +12,11 @@ use nih_plug_vizia::widgets::param_base::ParamWidgetBase;
 use nih_plug_vizia::widgets::util::ModifiersExt;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
+
+use gui_tokens::colours;
+use gui_tokens::metrics;
 
 /// Re-export vizia types for downstream plugins to avoid version conflicts.
 pub mod prelude {
@@ -104,9 +110,9 @@ impl Model for GregGuiData {
         event.map(|msg, _| match msg {
             GregGuiEvent::ToggleAdvanced => {
                 self.advanced_open = !self.advanced_open;
-                let h = if self.advanced_open { 560 } else { 360 };
+                let h = if self.advanced_open { 560 } else { 380 };
                 cx.emit(WindowEvent::SetSize(WindowSize {
-                    width: 820,
+                    width: 900,
                     height: h,
                 }));
             }
@@ -172,8 +178,8 @@ impl RotaryKnob {
                 .width(Stretch(1.0));
             }),
         )
-        .width(Pixels(80.0))
-        .height(Pixels(88.0))
+        .width(Pixels(metrics::KNOB_W))
+        .height(Pixels(metrics::KNOB_H))
     }
 }
 
@@ -229,10 +235,9 @@ impl View for RotaryKnob {
             return;
         }
 
-        let center_x = bounds.w / 2.0;
-        // Center knob in the middle area (between top label and bottom value)
-        let center_y = bounds.h * 0.5;
-        let knob_radius = 24.0; // 48px diameter
+        let center_x = bounds.x + bounds.w / 2.0;
+        let center_y = bounds.y + bounds.h / 2.0;
+        let knob_radius = metrics::KNOB_RADIUS; // 48px diameter
         let arc_radius = knob_radius * 0.85;
         let start_angle = -135.0_f32.to_radians();
         let end_angle = 135.0_f32.to_radians();
@@ -245,15 +250,15 @@ impl View for RotaryKnob {
         path.rect(bounds.x, bounds.y, bounds.w as f32, bounds.h as f32);
         canvas.fill_path(
             &path,
-            &Paint::color(Color::rgb(30, 32, 36).into()),
+            &Paint::color(Color::rgb(colours::SURFACE[0], colours::SURFACE[1], colours::SURFACE[2]).into()),
         );
 
-        // Outer bevel ring (border #5A6270)
+        // Outer bevel ring (border #2E333D)
         let mut path = Path::new();
         path.arc(center_x, center_y, knob_radius, start_angle, end_angle, Solidity::Solid);
         canvas.stroke_path(
             &path,
-            &Paint::color(Color::rgb(90, 98, 112).into()),
+            &Paint::color(Color::rgb(colours::BORDER[0], colours::BORDER[1], colours::BORDER[2]).into()),
         );
 
         // Ambra progression arc (#E5A93B)
@@ -261,7 +266,7 @@ impl View for RotaryKnob {
         path.arc(center_x, center_y, arc_radius, start_angle, angle, Solidity::Solid);
         canvas.stroke_path(
             &path,
-            &Paint::color(Color::rgb(229, 169, 59).into()),
+            &Paint::color(Color::rgb(colours::ACCENT[0], colours::ACCENT[1], colours::ACCENT[2]).into()),
         );
 
         // White indicator tick
@@ -273,7 +278,7 @@ impl View for RotaryKnob {
         path.line_to(ix, iy);
         canvas.stroke_path(
             &path,
-            &Paint::color(Color::rgb(255, 255, 255).into()),
+            &Paint::color(Color::rgb(colours::TEXT[0], colours::TEXT[1], colours::TEXT[2]).into()),
         );
     }
 }
@@ -613,7 +618,55 @@ impl View for GainReductionBarView {
     }
 }
 
-/// Costruisce l'editor Vizia standardizzato per tutti i plugin della suite.
+/// Identifies which widget type a parameter should be rendered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WidgetKind {
+    Knob, Toggle, Enum,
+}
+
+/// Static description of a parameter for the auto-generated parameter grid.
+/// Stores the label and a closure that builds the widget in a Vizia context.
+/// Plugins typically pass closures like `Box::new(|cx| RotaryKnob::new(cx, EditorData::params, |p| &p.threshold))`.
+pub struct ParamDef {
+    pub label: &'static str,
+    pub kind: WidgetKind,
+    pub build: Box<dyn Fn(&mut Context) + Send + Sync>,
+}
+
+impl ParamDef {
+    pub fn knob(label: &'static str, build: Box<dyn Fn(&mut Context) + Send + Sync>) -> Self {
+        Self { label, kind: WidgetKind::Knob, build }
+    }
+    pub fn toggle(label: &'static str, build: Box<dyn Fn(&mut Context) + Send + Sync>) -> Self {
+        Self { label, kind: WidgetKind::Toggle, build }
+    }
+    pub fn enum_switch(label: &'static str, build: Box<dyn Fn(&mut Context) + Send + Sync>) -> Self {
+        Self { label, kind: WidgetKind::Enum, build }
+    }
+}
+
+/// Auto-generated parameter grid that arranges parameters in a wrapping
+/// horizontal layout with a label above each control and the current value
+/// below it. The grid fills the available width and wraps to the next row.
+pub fn param_grid(cx: &mut Context, defs: &[ParamDef]) {
+    const PER_ROW: usize = 6;
+    VStack::new(cx, move |cx| {
+        for row in defs.chunks(PER_ROW) {
+            HStack::new(cx, move |cx| {
+                for def in row {
+                    (def.build)(cx);
+                }
+            })
+            .child_space(Pixels(metrics::GUTTER))
+            .height(Pixels(metrics::KNOB_H));
+        }
+    })
+    .child_space(Pixels(metrics::GUTTER))
+    .width(Stretch(1.0));
+}
+
+
+/// Backward-compatible wrapper: existing plugins keep their 4-argument calls.
 pub fn create_greg_editor<M, A>(
     title: &'static str,
     telemetry: Arc<GuiTelemetry>,
@@ -624,10 +677,19 @@ where
     M: Fn(&mut Context) + 'static + Send + Sync,
     A: Fn(&mut Context) + 'static + Send + Sync,
 {
-    let state = ViziaState::new(|| (820, 360));
+    create_greg_editor_with_params(title, telemetry, main_builder, advanced_builder, None)
+}
+
+/// Fallback editor: minimal safe UI when the main builder panics.
+/// Shows title, error message, and active metering. No interactive controls.
+pub fn create_fallback_editor(
+    title: &'static str,
+    telemetry: Arc<GuiTelemetry>,
+) -> Option<Box<dyn Editor>>
+{
+    let state = ViziaState::new(|| (800, 400));
     let title_str = title.to_string();
-    let main_fn = Arc::new(main_builder);
-    let adv_fn = Arc::new(advanced_builder);
+    let telemetry_clone = telemetry.clone();
 
     create_vizia_editor(state, ViziaTheming::Custom, move |cx, _| {
         assets::register_noto_sans_regular(cx);
@@ -636,129 +698,148 @@ where
         GregGuiData {
             plugin_title: title_str.clone(),
             advanced_open: false,
-            telemetry: telemetry.clone(),
+            telemetry: telemetry_clone.clone(),
         }
         .build(cx);
 
-        let tel_out = telemetry.clone();
-        let tel_in = telemetry.clone();
-        let tel_foot = telemetry.clone();
-        let m_fn = main_fn.clone();
-        let a_fn = adv_fn.clone();
+        let tel_out = telemetry_clone.clone();
+        let tel_in = telemetry_clone.clone();
+        let tel_foot = telemetry_clone.clone();
 
         VStack::new(cx, move |cx| {
-            // HEADER
             HStack::new(cx, |cx| {
-                Label::new(cx, GregGuiData::plugin_title)
-                    .font_size(15.0)
+                Label::new(cx, "Greg Plugin -- Fallback Mode")
+                    .font_size(14.0)
                     .font_weight(FontWeightKeyword::Bold)
-                    .color(Color::rgb(235, 225, 205))
+                    .color(Color::rgb(229, 122, 59))
                     .left(Pixels(12.0));
                 Element::new(cx).width(Stretch(1.0));
-                Button::new(
-                    cx,
-                    |cx| cx.emit(GregGuiEvent::ToggleAdvanced),
-                    |cx| {
-                        Label::new(
-                            cx,
-                            GregGuiData::advanced_open.map(|o| if *o { "- ADV" } else { "+ ADV" }),
-                        )
-                    },
-                )
-                .right(Pixels(12.0));
             })
             .height(Pixels(38.0))
             .background_color(Color::rgb(24, 26, 30))
             .child_top(Stretch(1.0))
             .child_bottom(Stretch(1.0));
 
-            // CORPO CENTRALE: IN (SX) | MAIN + ADV | OUT (DX)
             HStack::new(cx, move |cx| {
-                // IN METER (SX)
                 VStack::new(cx, move |cx| {
                     Label::new(cx, "IN")
                         .font_size(10.0)
                         .color(Color::rgb(180, 185, 195));
-                    ChannelMeterView {
-                        telemetry: tel_in.clone(),
-                        is_output: false,
-                    }
-                    .build(cx, |_| { })
-                    .width(Pixels(46.0))
-                    .height(Stretch(1.0));
+                    ChannelMeterView { telemetry: tel_in.clone(), is_output: false }
+                        .build(cx, |_| { })
+                        .width(Pixels(46.0))
+                        .height(Stretch(1.0));
                 })
                 .width(Pixels(62.0))
                 .child_space(Pixels(6.0))
                 .background_color(Color::rgb(22, 24, 28));
 
-                // AREA CENTRALE PERSISTENTE
                 VStack::new(cx, |cx| {
-                    HStack::new(cx, move |cx| {
-                        (m_fn)(cx);
-                    })
-                    .height(Pixels(96.0))
-                    .child_space(Pixels(10.0))
-                    .width(Stretch(1.0))
-                    .background_color(Color::rgb(34, 37, 42));
-
-                    Binding::new(cx, GregGuiData::advanced_open, move |cx, open| {
-                        let a_inner = a_fn.clone();
-                        if open.get(cx) {
-                            VStack::new(cx, |cx| {
-                                (a_inner)(cx);
-                            })
-                            .height(Pixels(200.0))
-                            .background_color(Color::rgb(28, 30, 35))
-                            .child_space(Pixels(10.0))
-                            .width(Stretch(1.0))
-                            .height(Stretch(1.0));
-                        }
-                    });
+                    Label::new(cx, "GUI build failed -- running safe fallback mode")
+                        .font_size(12.0).color(Color::rgb(229, 122, 59))
+                        .child_top(Pixels(12.0)).left(Pixels(12.0));
+                    Label::new(cx, "Parameters are still controllable via DAW automation.")
+                        .font_size(10.0).color(Color::rgb(180, 185, 195))
+                        .left(Pixels(12.0));
+                    Label::new(cx, "Metering is active below.")
+                        .font_size(10.0).color(Color::rgb(180, 185, 195))
+                        .left(Pixels(12.0));
                 })
-                .width(Stretch(1.0))
-                .height(Stretch(1.0));
+                .width(Stretch(1.0)).height(Stretch(1.0)).child_space(Pixels(8.0));
 
-                // OUT METER (DX)
                 VStack::new(cx, move |cx| {
                     Label::new(cx, "OUT")
-                        .font_size(10.0)
-                        .color(Color::rgb(180, 185, 195));
-                    ChannelMeterView {
-                        telemetry: tel_out.clone(),
-                        is_output: true,
-                    }
-                    .build(cx, |_| {})
-                    .width(Pixels(46.0))
-                    .height(Stretch(1.0));
+                        .font_size(10.0).color(Color::rgb(180, 185, 195));
+                    ChannelMeterView { telemetry: tel_out.clone(), is_output: true }
+                        .build(cx, |_| {})
+                        .width(Pixels(46.0)).height(Stretch(1.0));
                 })
-                .width(Pixels(62.0))
-                .child_space(Pixels(6.0))
+                .width(Pixels(62.0)).child_space(Pixels(6.0))
                 .background_color(Color::rgb(22, 24, 28));
             })
             .height(Stretch(1.0));
 
-            // FOOTER: PHASE & GAIN REDUCTION
             HStack::new(cx, move |cx| {
-                Label::new(cx, "PHASE [-1..+1]")
-                    .font_size(10.0)
-                    .color(Color::rgb(175, 180, 190))
-                    .left(Pixels(12.0));
+                Label::new(cx, "PHASE").font_size(10.0).color(Color::rgb(175, 180, 190)).left(Pixels(12.0));
+                Element::new(cx).width(Stretch(1.0));
                 Element::new(cx).width(Stretch(1.0));
                 if tel_foot.show_gr_meter.load(Ordering::Relaxed) {
-                    Label::new(cx, "GR -0.0 dB")
-                        .font_size(10.0)
-                        .color(Color::rgb(229, 122, 59))
-                        .right(Pixels(12.0));
+                    Label::new(cx, "GR").font_size(10.0).color(Color::rgb(175, 180, 190)).right(Pixels(4.0));
+                    GainReductionBarView { telemetry: tel_foot.clone() }.build(cx, |_| {}).width(Pixels(120.0)).height(Pixels(14.0)).right(Pixels(4.0));
+                    Label::new(cx, "GR_DB_FMT").font_size(10.0).color(Color::rgb(229, 122, 59)).right(Pixels(12.0));
                 }
             })
-            .height(Pixels(34.0))
-            .background_color(Color::rgb(24, 26, 30))
-            .child_top(Stretch(1.0))
-            .child_bottom(Stretch(1.0));
+            .height(Pixels(34.0)).background_color(Color::rgb(24, 26, 30))
+            .child_top(Stretch(1.0)).child_bottom(Stretch(1.0));
         })
         .background_color(Color::rgb(20, 22, 25));
     })
 }
+
+/// Extended version with an optional auto-generated parameter grid.
+pub fn create_greg_editor_with_params<M, A>(
+    title: &'static str,
+    telemetry: Arc<GuiTelemetry>,
+    main_builder: M,
+    advanced_builder: A,
+    param_defs: Option<&'static [ParamDef]>,
+) -> Option<Box<dyn Editor>>
+where
+    M: Fn(&mut Context) + 'static + Send + Sync,
+    A: Fn(&mut Context) + 'static + Send + Sync,
+{
+    let state = ViziaState::new(|| (820, 360));
+    let title_str = title.to_string();
+    let main_fn = Arc::new(main_builder);
+    let adv_fn = Arc::new(advanced_builder);
+    let telemetry_clone = telemetry.clone();
+
+    match catch_unwind(AssertUnwindSafe(|| {
+        create_vizia_editor(state, ViziaTheming::Custom, move |cx, _| {
+            assets::register_noto_sans_regular(cx);
+            assets::register_noto_sans_bold(cx);
+            GregGuiData { plugin_title: title_str.clone(), advanced_open: false, telemetry: telemetry.clone() }.build(cx);
+            let tel_out = telemetry.clone();
+            let tel_in = telemetry.clone();
+            let tel_foot = telemetry.clone();
+            let m_fn = main_fn.clone();
+            let a_fn = adv_fn.clone();
+            VStack::new(cx, move |cx| {
+                HStack::new(cx, |cx| {
+                    Label::new(cx, GregGuiData::plugin_title).font_size(15.0).font_weight(FontWeightKeyword::Bold).color(Color::rgb(235, 225, 205)).left(Pixels(12.0));
+                    Element::new(cx).width(Stretch(1.0));
+                    Button::new(cx, |cx| cx.emit(GregGuiEvent::ToggleAdvanced), |cx| Label::new(cx, GregGuiData::advanced_open.map(|o| if *o { "- ADV" } else { "+ ADV" }))).right(Pixels(12.0));
+                }).height(Pixels(38.0)).background_color(Color::rgb(24, 26, 30)).child_top(Stretch(1.0)).child_bottom(Stretch(1.0));
+                HStack::new(cx, move |cx| {
+                    VStack::new(cx, move |cx| { Label::new(cx, "IN").font_size(10.0).color(Color::rgb(180, 185, 195)); ChannelMeterView { telemetry: tel_in.clone(), is_output: false }.build(cx, |_| {}).width(Pixels(46.0)).height(Stretch(1.0)); }).width(Pixels(62.0)).child_space(Pixels(6.0)).background_color(Color::rgb(22, 24, 28));
+                    VStack::new(cx, |cx| {
+                        if let Some(defs) = param_defs { param_grid(cx, defs); }
+                        else { HStack::new(cx, move |cx| { (m_fn)(cx); }).height(Pixels(96.0)).child_space(Pixels(10.0)).width(Stretch(1.0)).background_color(Color::rgb(32, 35, 42)); }
+                        Binding::new(cx, GregGuiData::advanced_open, move |cx, open| {
+                            let a_inner = a_fn.clone();
+                            if open.get(cx) { VStack::new(cx, |cx| { (a_inner)(cx); }).height(Pixels(200.0)).background_color(Color::rgb(28, 30, 35)).child_space(Pixels(10.0)).width(Stretch(1.0)).height(Stretch(1.0)); }
+                        });
+                    }).width(Stretch(1.0)).height(Stretch(1.0)).child_space(Pixels(8.0));
+                    VStack::new(cx, move |cx| { Label::new(cx, "OUT").font_size(10.0).color(Color::rgb(180, 185, 195)); ChannelMeterView { telemetry: tel_out.clone(), is_output: true }.build(cx, |_| {}).width(Pixels(46.0)).height(Stretch(1.0)); }).width(Pixels(62.0)).child_space(Pixels(6.0)).background_color(Color::rgb(22, 24, 28));
+                }).height(Stretch(1.0));
+                HStack::new(cx, move |cx| {
+                    Label::new(cx, "PHASE").font_size(10.0).color(Color::rgb(175, 180, 190)).left(Pixels(12.0));
+                    Element::new(cx).width(Stretch(1.0));
+                    Element::new(cx).width(Stretch(1.0));
+                    if tel_foot.show_gr_meter.load(Ordering::Relaxed) {
+                        Label::new(cx, "GR").font_size(10.0).color(Color::rgb(175, 180, 190)).right(Pixels(4.0));
+                        GainReductionBarView { telemetry: tel_foot.clone() }.build(cx, |_| {}).width(Pixels(120.0)).height(Pixels(14.0)).right(Pixels(4.0));
+                        Label::new(cx, "GR_DB_FMT").font_size(10.0).color(Color::rgb(229, 122, 59)).right(Pixels(12.0));
+                    }
+                }).height(Pixels(34.0)).background_color(Color::rgb(24, 26, 30)).child_top(Stretch(1.0)).child_bottom(Stretch(1.0));
+            }).background_color(Color::rgb(20, 22, 25));
+        })
+    })) {
+        Ok(editor) => editor,
+        Err(_) => create_fallback_editor(title, telemetry_clone),
+    }
+}
+
 
 
 pub fn param_control<P, L>(cx: &mut Context, label: &'static str, params: L)
