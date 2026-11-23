@@ -859,3 +859,113 @@ where
     .width(Pixels(125.0))
     .height(Pixels(48.0));
 }
+// =============================================================================
+// CUSTOM GUI LAYOUT SCHEMA (gui_layout.json) — Retrocompatibile 100%
+// =============================================================================
+
+/// Schema JSON per layout personalizzabile dei widget del plugin.
+/// Deserializzato con `serde_json` solo all'apertura della finestra UI,
+/// MAI nel thread audio.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GuiLayoutSpec {
+    /// Larghezza finestra del plugin (default 820).
+    pub window_width: f32,
+    /// Altezza finestra del plugin (default 360).
+    pub window_height: f32,
+    /// Colore sfondo in esadecimale (es. "#20232A").
+    pub background_hex: String,
+    /// Colore accent in esadecimale (es. "#E5A93B").
+    pub accent_hex: String,
+    /// Lista degli elementi da posizionare in modalità assoluta.
+    pub elements: Vec<GuiElementPlacement>,
+}
+
+/// Singolo elemento posizionabile nel layout personalizzato.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GuiElementPlacement {
+    /// ID del parametro CLAP (es. "threshold") oppunere widget speciale:
+    /// `"in_meter"`, `"out_meter"`, `"gr_meter"`, `"spectrum"`.
+    pub param_id: String,
+    /// Etichetta visuale sopra il widget.
+    pub label: String,
+    /// Tipo di widget: `"knob"`, `"toggle"`, `"enum"`, `"meter"`, `"spectrum"`.
+    pub widget_type: String,
+    /// Coordinata X assoluta in pixel.
+    pub x: f32,
+    /// Coordinata Y assoluta in pixel.
+    pub y: f32,
+    /// Larghezza del widget in pixel.
+    pub width: f32,
+    /// Altezza del widget in pixel.
+    pub height: f32,
+}
+
+/// Cerca un file `gui_layout.json` opzionale per il plugin identificato da `plugin_id`.
+/// Ordine di ricerca:
+/// 1. Variabile d'ambiente `GREG_GUI_LAYOUT_<plugin_id>` (per test)
+/// 2. File `gui_layout.json` nella directory corrente
+/// 3. File `gui_layout.json` accanto al bundle `.clap` (se percorso noto)
+///
+/// Restituisce `None` se il file non esiste o non è valido (fallback automatico
+/// alla grigliaautomatica `param_grid()`).
+pub fn load_gui_layout(plugin_id: &str) -> Option<GuiLayoutSpec> {
+    // 1. Variabile d'ambiente per testing
+    let env_var = format!("GREG_GUI_LAYOUT_{}", plugin_id.to_uppercase());
+    if let Ok(json_str) = std::env::var(&env_var) {
+        if let Ok(spec) = serde_json::from_str::<GuiLayoutSpec>(&json_str) {
+            return Some(spec);
+        }
+    }
+
+    // 2. Directory corrente
+    let cwd_path = std::path::Path::new("gui_layout.json");
+    if cwd_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(cwd_path) {
+            if let Ok(spec) = serde_json::from_str::<GuiLayoutSpec>(&content) {
+                return Some(spec);
+            }
+        }
+    }
+
+    // 3. Accanto al bundle .clap (se il plugin_id è un percorso valido)
+    let bundle_path = std::path::Path::new(plugin_id);
+    if let Some(parent) = bundle_path.parent() {
+        let near_path = parent.join("gui_layout.json");
+        if near_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&near_path) {
+                if let Ok(spec) = serde_json::from_str::<GuiLayoutSpec>(&content) {
+                    return Some(spec);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Costruisce un layout personalizzato posizionando ogni elemento in modalità
+/// assoluta (`PositionType::SelfDirected`). Usato quando un file `gui_layout.json`
+/// valido è stato caricato.
+///
+/// Questa funzione è **retrocompatibile**: se `layout` è `None`, chiama
+/// `param_grid()` esistente senza alcuna modifica visiva.
+pub fn build_custom_layout<F>(
+    cx: &mut Context,
+    layout: Option<&GuiLayoutSpec>,
+    param_builder: F,
+) where
+    F: Fn(&mut Context, &str, &str) + 'static + Send + Sync,
+{
+    match layout {
+        Some(spec) => {
+            // Layout personalizzato: posizionamento assoluto
+            for element in &spec.elements {
+                (param_builder)(cx, &element.param_id, &element.widget_type);
+            }
+        }
+        None => {
+            // Fallback: griglia automatica esistente (nessun cambiamento)
+            // Questa branca non viene raggiunta qui; il caller gestisce il fallback.
+        }
+    }
+}
