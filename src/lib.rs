@@ -677,6 +677,10 @@ where
     M: Fn(&mut Context) + 'static + Send + Sync,
     A: Fn(&mut Context) + 'static + Send + Sync,
 {
+    // Immediate GREG_NO_GUI=1 check: skip GUI entirely when headless mode is requested.
+    if std::env::var("GREG_NO_GUI").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        return None;
+    }
     create_greg_editor_with_params(title, telemetry, main_builder, advanced_builder, None)
 }
 
@@ -788,6 +792,11 @@ where
     M: Fn(&mut Context) + 'static + Send + Sync,
     A: Fn(&mut Context) + 'static + Send + Sync,
 {
+    // Immediate GREG_NO_GUI=1 check: skip GUI entirely when headless mode is requested.
+    if std::env::var("GREG_NO_GUI").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        return None;
+    }
+
     let state = ViziaState::new(|| (820, 360));
     let title_str = title.to_string();
     let main_fn = Arc::new(main_builder);
