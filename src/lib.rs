@@ -690,48 +690,27 @@ fn is_gui_supported() -> bool {
     if std::env::var("DISPLAY").map(|v| v.is_empty()).unwrap_or(true) {
         return false;
     }
-    // Detect hypervisor/VM environments — GUI is disabled by default there
-    if let Ok(product) = std::fs::read_to_string("/sys/class/dmi/id/product_name") {
-        let lower = product.to_ascii_lowercase();
-        if lower.contains("virtualbox")
-            || lower.contains("vmware")
-            || lower.contains("qemu")
-            || lower.contains("kvm")
-            || lower.contains("parallels")
-        {
-            return false;
-        }
-    }
-    if let Ok(vendor) = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor") {
-        let lower = vendor.to_ascii_lowercase();
-        if lower.contains("virtualbox")
-            || lower.contains("vmware")
-            || lower.contains("qemu")
-            || lower.contains("kvm")
-            || lower.contains("parallels")
-        {
-            return false;
-        }
-    }
     true
 }
 
 /// Backward-compatible wrapper: existing plugins keep their 4-argument calls.
-pub fn create_greg_editor<M, A>(
+pub fn create_greg_editor<M, A, MB>(
     title: &'static str,
     telemetry: Arc<GuiTelemetry>,
     main_builder: M,
     advanced_builder: A,
+    model_builder: MB,
 ) -> Option<Box<dyn Editor>>
 where
     M: Fn(&mut Context) + 'static + Send + Sync,
     A: Fn(&mut Context) + 'static + Send + Sync,
+    MB: Fn(&mut Context) + 'static + Send + Sync,
 {
     // Use the central helper — returns false for forced no-GUI or VM environments
     if !is_gui_supported() {
         return None;
     }
-    create_greg_editor_with_params(title, telemetry, main_builder, advanced_builder, None)
+    create_greg_editor_with_params(title, telemetry, main_builder, advanced_builder, None, model_builder)
 }
 
 /// Fallback editor: minimal safe UI when the main builder panics.
@@ -837,16 +816,18 @@ pub fn create_fallback_editor(
 }
 
 /// Extended version with an optional auto-generated parameter grid.
-pub fn create_greg_editor_with_params<M, A>(
+pub fn create_greg_editor_with_params<M, A, MB>(
     title: &'static str,
     telemetry: Arc<GuiTelemetry>,
     main_builder: M,
     advanced_builder: A,
     param_defs: Option<&'static [ParamDef]>,
+    model_builder: MB,
 ) -> Option<Box<dyn Editor>>
 where
     M: Fn(&mut Context) + 'static + Send + Sync,
     A: Fn(&mut Context) + 'static + Send + Sync,
+    MB: Fn(&mut Context) + 'static + Send + Sync,
 {
     // Centralized GUI support check: returns false for forced no-GUI or VM environments
     if !is_gui_supported() {
@@ -860,7 +841,13 @@ where
 
     create_vizia_editor(state, ViziaTheming::Custom, move |cx, _| {
         // Catch panics inside the window thread so it never aborts.
-        let _ = catch_unwind(AssertUnwindSafe(|| {
+        // The model_builder is invoked BEFORE the parameter grid / main builder
+        // so that every Lens (e.g. EditorData::params) resolves against a tree
+        // that has already been built into the Vizia context — no
+        // "Failed to get data from context. Has it been built into the tree?"
+        // panic can occur.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            model_builder(cx);
             assets::register_noto_sans_regular(cx);
             assets::register_noto_sans_bold(cx);
             GregGuiData { plugin_title: title_str.clone(), advanced_open: false, telemetry: telemetry.clone() }.build(cx);
@@ -899,6 +886,16 @@ where
                 }).height(Pixels(34.0)).background_color(Color::rgb(24, 26, 30)).child_top(Stretch(1.0)).child_bottom(Stretch(1.0));
             }).background_color(Color::rgb(20, 22, 25));
         }));
+        // Emergency safe Label: if the window thread panicked while building
+        // the tree, render a minimal notice instead of letting the panic
+        // propagate so `window_thread` can never abort the DAW.
+        if result.is_err() {
+            Label::new(cx, "Greg GUI - Safe Fallback (UI build panic recovered)")
+                .font_size(13.0)
+                .font_weight(FontWeightKeyword::Bold)
+                .color(Color::rgb(229, 122, 59))
+                .left(Pixels(12.0));
+        }
     })
 }
 
