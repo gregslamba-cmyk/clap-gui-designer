@@ -857,10 +857,10 @@ where
     let title_str = title.to_string();
     let main_fn = Arc::new(main_builder);
     let adv_fn = Arc::new(advanced_builder);
-    let telemetry_clone = telemetry.clone();
 
-    match catch_unwind(AssertUnwindSafe(|| {
-        create_vizia_editor(state, ViziaTheming::Custom, move |cx, _| {
+    create_vizia_editor(state, ViziaTheming::Custom, move |cx, _| {
+        // Catch panics inside the window thread so it never aborts.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
             assets::register_noto_sans_regular(cx);
             assets::register_noto_sans_bold(cx);
             GregGuiData { plugin_title: title_str.clone(), advanced_open: false, telemetry: telemetry.clone() }.build(cx);
@@ -898,11 +898,8 @@ where
                     }
                 }).height(Pixels(34.0)).background_color(Color::rgb(24, 26, 30)).child_top(Stretch(1.0)).child_bottom(Stretch(1.0));
             }).background_color(Color::rgb(20, 22, 25));
-        })
-    })) {
-        Ok(editor) => editor,
-        Err(_) => create_fallback_editor(title, telemetry_clone),
-    }
+        }));
+    })
 }
 
 
