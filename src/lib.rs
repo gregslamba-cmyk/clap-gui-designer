@@ -538,7 +538,7 @@ impl View for ChannelMeterView {
             } else {
                 self.telemetry.in_peaks[ch].swap(0.0f32.to_bits(), Ordering::Relaxed)
             };
-            let peak = f32::from_bits(bits);
+            let peak = if f32::from_bits(bits).is_finite() { f32::from_bits(bits) } else { 0.0 };
             let db = nih_plug::util::gain_to_db(peak.max(1e-6)).clamp(-60.0, 0.0);
             let norm = (db + 60.0) / 60.0;
 
@@ -577,11 +577,19 @@ impl View for GainReductionBarView {
 
     fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
         let bounds = cx.bounds();
-        let gr_db = f32::from_bits(
+        let gr_db = if f32::from_bits(
             self.telemetry
                 .gain_reduction_db
                 .load(Ordering::Relaxed),
-        )
+        ).is_finite() {
+            f32::from_bits(
+                self.telemetry
+                    .gain_reduction_db
+                    .load(Ordering::Relaxed),
+            )
+        } else {
+            0.0
+        }
         .clamp(-24.0, 0.0);
         let gr_norm = (gr_db + 24.0) / 24.0;
 
@@ -666,6 +674,48 @@ pub fn param_grid(cx: &mut Context, defs: &[ParamDef]) {
 }
 
 
+/// Determines if GUI rendering is supported on this system.
+/// Returns `false` if headless mode is forced, no display is available,
+/// or we're running inside a hypervisor/VM without forced GUI.
+fn is_gui_supported() -> bool {
+    // Force GUI overrides everything
+    if std::env::var("GREG_FORCE_GUI").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        return true;
+    }
+    // Explicit headless mode
+    if std::env::var("GREG_NO_GUI").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        return false;
+    }
+    // No DISPLAY variable means no X11/Wayland server available
+    if std::env::var("DISPLAY").map(|v| v.is_empty()).unwrap_or(true) {
+        return false;
+    }
+    // Detect hypervisor/VM environments — GUI is disabled by default there
+    if let Ok(product) = std::fs::read_to_string("/sys/class/dmi/id/product_name") {
+        let lower = product.to_ascii_lowercase();
+        if lower.contains("virtualbox")
+            || lower.contains("vmware")
+            || lower.contains("qemu")
+            || lower.contains("kvm")
+            || lower.contains("parallels")
+        {
+            return false;
+        }
+    }
+    if let Ok(vendor) = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor") {
+        let lower = vendor.to_ascii_lowercase();
+        if lower.contains("virtualbox")
+            || lower.contains("vmware")
+            || lower.contains("qemu")
+            || lower.contains("kvm")
+            || lower.contains("parallels")
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Backward-compatible wrapper: existing plugins keep their 4-argument calls.
 pub fn create_greg_editor<M, A>(
     title: &'static str,
@@ -677,8 +727,8 @@ where
     M: Fn(&mut Context) + 'static + Send + Sync,
     A: Fn(&mut Context) + 'static + Send + Sync,
 {
-    // Immediate GREG_NO_GUI=1 check: skip GUI entirely when headless mode is requested.
-    if std::env::var("GREG_NO_GUI").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+    // Use the central helper — returns false for forced no-GUI or VM environments
+    if !is_gui_supported() {
         return None;
     }
     create_greg_editor_with_params(title, telemetry, main_builder, advanced_builder, None)
@@ -691,6 +741,12 @@ pub fn create_fallback_editor(
     telemetry: Arc<GuiTelemetry>,
 ) -> Option<Box<dyn Editor>>
 {
+    // If GUI is not supported (no display, VM, etc.), return None immediately.
+    // The fallback editor must NEVER spawn a ViziaEditor when headless.
+    if !is_gui_supported() {
+        return None;
+    }
+
     let state = ViziaState::new(|| (800, 400));
     let title_str = title.to_string();
     let telemetry_clone = telemetry.clone();
@@ -792,8 +848,8 @@ where
     M: Fn(&mut Context) + 'static + Send + Sync,
     A: Fn(&mut Context) + 'static + Send + Sync,
 {
-    // Immediate GREG_NO_GUI=1 check: skip GUI entirely when headless mode is requested.
-    if std::env::var("GREG_NO_GUI").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+    // Centralized GUI support check: returns false for forced no-GUI or VM environments
+    if !is_gui_supported() {
         return None;
     }
 
