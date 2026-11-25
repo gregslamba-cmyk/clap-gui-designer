@@ -155,23 +155,26 @@ impl RotaryKnob {
                     param.normalized_value_to_string(param.unmodulated_normalized_value(), true)
                 });
 
-                ZStack::new(cx, |cx| {
-                    // Parameter label (top)
+                VStack::new(cx, |cx| {
+                    // Parameter label (top band, centered white, no overlap)
                     Label::new(cx, param_data.param().name())
-                        .height(Pixels(12.0))
+                        .height(Pixels(18.0))
                         .width(Stretch(1.0))
                         .font_size(10.0)
                         .color(Color::rgb(210, 215, 225))
-                        .child_top(Pixels(4.0))
                         .hoverable(false);
 
-                    // Value display (bottom)
+                    // Middle band: flexible spacer so the graphic lives in the center.
+                    Label::new(cx, "")
+                        .height(Stretch(1.0))
+                        .hoverable(false);
+
+                    // Value display (bottom band, centered amber, no overlap)
                     Label::new(cx, display_value_lens)
-                        .height(Pixels(14.0))
+                        .height(Pixels(18.0))
                         .width(Stretch(1.0))
                         .font_size(10.0)
                         .color(Color::rgb(230, 185, 50))
-                        .child_bottom(Pixels(4.0))
                         .hoverable(false);
                 })
                 .height(Stretch(1.0))
@@ -311,23 +314,26 @@ impl ToggleSwitch {
                     if is_active { "ON".to_string() } else { "OFF".to_string() }
                 });
 
-                ZStack::new(cx, |cx| {
-                    // Parameter label (top)
+                VStack::new(cx, |cx| {
+                    // Parameter label (top band, centered white, no overlap)
                     Label::new(cx, param_data.param().name())
-                        .height(Pixels(12.0))
+                        .height(Pixels(18.0))
                         .width(Stretch(1.0))
                         .font_size(10.0)
                         .color(Color::rgb(210, 215, 225))
-                        .child_top(Pixels(4.0))
                         .hoverable(false);
 
-                    // State label (bottom): ON or OFF
+                    // Middle band: flexible spacer so the graphic lives in the center.
+                    Label::new(cx, "")
+                        .height(Stretch(1.0))
+                        .hoverable(false);
+
+                    // State label (bottom band): ON or OFF, centered amber, no overlap
                     Label::new(cx, display_value_lens)
-                        .height(Pixels(14.0))
+                        .height(Pixels(18.0))
                         .width(Stretch(1.0))
                         .font_size(10.0)
                         .color(Color::rgb(230, 185, 50))
-                        .child_bottom(Pixels(4.0))
                         .hoverable(false);
                 })
                 .height(Stretch(1.0))
@@ -428,23 +434,26 @@ impl EnumSwitch {
                     param.normalized_value_to_string(param.unmodulated_normalized_value(), true)
                 });
 
-                ZStack::new(cx, |cx| {
-                    // Parameter label (top)
+                VStack::new(cx, |cx| {
+                    // Parameter label (top band, centered white, no overlap)
                     Label::new(cx, param_data.param().name())
-                        .height(Pixels(12.0))
+                        .height(Pixels(18.0))
                         .width(Stretch(1.0))
                         .font_size(10.0)
                         .color(Color::rgb(210, 215, 225))
-                        .child_top(Pixels(4.0))
                         .hoverable(false);
 
-                    // Active value text (bottom)
+                    // Middle band: flexible spacer so the graphic lives in the center.
+                    Label::new(cx, "")
+                        .height(Stretch(1.0))
+                        .hoverable(false);
+
+                    // Active value text (bottom band): centered amber, no overlap
                     Label::new(cx, display_value_lens)
-                        .height(Pixels(14.0))
+                        .height(Pixels(18.0))
                         .width(Stretch(1.0))
                         .font_size(10.0)
                         .color(Color::rgb(230, 185, 50))
-                        .child_bottom(Pixels(4.0))
                         .hoverable(false);
                 })
                 .height(Stretch(1.0))
@@ -805,7 +814,7 @@ pub fn create_fallback_editor(
                 if tel_foot.show_gr_meter.load(Ordering::Relaxed) {
                     Label::new(cx, "GR").font_size(10.0).color(Color::rgb(175, 180, 190)).right(Pixels(4.0));
                     GainReductionBarView { telemetry: tel_foot.clone() }.build(cx, |_| {}).width(Pixels(120.0)).height(Pixels(14.0)).right(Pixels(4.0));
-                    Label::new(cx, "GR_DB_FMT").font_size(10.0).color(Color::rgb(229, 122, 59)).right(Pixels(12.0));
+                    Label::new(cx, "-0.0 dB").font_size(10.0).color(Color::rgb(229, 122, 59)).right(Pixels(12.0));
                 }
             })
             .height(Pixels(34.0)).background_color(Color::rgb(24, 26, 30))
@@ -881,7 +890,7 @@ where
                     if tel_foot.show_gr_meter.load(Ordering::Relaxed) {
                         Label::new(cx, "GR").font_size(10.0).color(Color::rgb(175, 180, 190)).right(Pixels(4.0));
                         GainReductionBarView { telemetry: tel_foot.clone() }.build(cx, |_| {}).width(Pixels(120.0)).height(Pixels(14.0)).right(Pixels(4.0));
-                        Label::new(cx, "GR_DB_FMT").font_size(10.0).color(Color::rgb(229, 122, 59)).right(Pixels(12.0));
+                        Label::new(cx, "-0.0 dB").font_size(10.0).color(Color::rgb(229, 122, 59)).right(Pixels(12.0));
                     }
                 }).height(Pixels(34.0)).background_color(Color::rgb(24, 26, 30)).child_top(Stretch(1.0)).child_bottom(Stretch(1.0));
             }).background_color(Color::rgb(20, 22, 25));
