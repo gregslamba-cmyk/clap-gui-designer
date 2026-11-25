@@ -12,8 +12,28 @@ use nih_plug_vizia::widgets::param_base::ParamWidgetBase;
 use nih_plug_vizia::widgets::util::ModifiersExt;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+/// Hardware knob visual sizing (per `GUI_SPEC.md` v2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnobSize {
+    Large,
+    Medium,
+    Small,
+}
+
+impl KnobSize {
+    pub fn diameter_px(self) -> f32 {
+        match self {
+            KnobSize::Large => 64.0,
+            KnobSize::Medium => 48.0,
+            KnobSize::Small => 36.0,
+        }
+    }
+}
+
+/// Standard UI metrics.
 
 use gui_tokens::colours;
 use gui_tokens::metrics;
@@ -24,6 +44,7 @@ pub mod prelude {
     pub use crate::RotaryKnob;
     pub use crate::ToggleSwitch;
     pub use crate::EnumSwitch;
+    pub use crate::DropdownSelect;
 }
 
 /// Numero massimo di canali simultanei supportati nei meter multicanale SX/DX.
@@ -134,6 +155,9 @@ impl Model for GregGuiData {
 pub struct RotaryKnob {
     param_base: ParamWidgetBase,
     drag_active: bool,
+    drag_start_y: f32,
+    drag_start_norm: f32,
+    last_norm: f32,
 }
 
 impl RotaryKnob {
@@ -147,6 +171,9 @@ impl RotaryKnob {
         Self {
             param_base: ParamWidgetBase::new(cx, params, params_to_param),
             drag_active: false,
+            drag_start_y: 0.0,
+            drag_start_norm: 0.0,
+            last_norm: 0.0,
         }
         .build(
             cx,
@@ -198,6 +225,11 @@ impl View for RotaryKnob {
                 self.param_base.begin_set_parameter(cx);
                 cx.capture();
                 cx.set_active(true);
+                // Record start position and normalized value for 200px drag range.
+                let bounds = cx.bounds();
+                self.drag_start_y = bounds.y + bounds.h / 2.0;
+                self.drag_start_norm = self.param_base.unmodulated_normalized_value();
+                self.last_norm = self.drag_start_norm;
             }
             WindowEvent::MouseUp(MouseButton::Left) => {
                 if self.drag_active {
@@ -209,11 +241,19 @@ impl View for RotaryKnob {
             }
             WindowEvent::MouseMove(_x, y) => {
                 if self.drag_active {
-                    let bounds = cx.bounds();
-                    let center_y = bounds.h / 2.0;
-                    let rel_y = center_y - y;
-                    let norm = (rel_y / (bounds.h / 2.0)).clamp(-1.0, 1.0);
-                    self.param_base.set_normalized_value(cx, norm);
+                    // Full normalized range (0.0..1.0) mapped over 200px vertical travel.
+                    // With Shift (0.1x) resolution is finer: each pixel moves by 0.1/200 of a step.
+                    let scale = if cx.modifiers().shift() { 0.1 } else { 1.0 };
+                    let delta = (*y - self.drag_start_y) * scale / 200.0;
+                    let norm = self.drag_start_norm + delta;
+                    let norm = norm.clamp(0.0, 1.0);
+                    if (norm - self.last_norm).abs() > 0.002 {
+                        self.param_base.set_normalized_value(cx, norm);
+                        cx.needs_redraw();
+                    } else {
+                        self.param_base.set_normalized_value(cx, norm);
+                    }
+                    self.last_norm = norm;
                 }
             }
             WindowEvent::MouseScroll(_x, scroll_y) => {
@@ -524,6 +564,135 @@ impl View for EnumSwitch {
         );
     }
 }
+
+/// Hardware dropdown selector for discrete / enum (`EnumParam`) parameters.
+#[derive(Lens)]
+pub struct DropdownSelect {
+    param_base: ParamWidgetBase,
+    expanded: bool,
+    options: &'static [&'static str],
+    last_y: f32,
+}
+
+impl DropdownSelect {
+    pub fn new<'a, L, Params, P, FMap>(
+        cx: &'a mut Context,
+        params: L,
+        params_to_param: FMap,
+        options: &'static [&'static str],
+    ) -> Handle<'a, DropdownSelect>
+    where
+        L: Lens<Target = Params> + Clone,
+        Params: 'static,
+        P: Param + 'static,
+        FMap: Fn(&Params) -> &P + Copy + 'static,
+    {
+        let expanded = false;
+        Self {
+            param_base: ParamWidgetBase::new(cx, params, params_to_param),
+            expanded,
+            options,
+            last_y: 0.0,
+        }
+        .build(
+            cx,
+            ParamWidgetBase::build_view(params, params_to_param, move |cx, param_data| {
+                let display_value_lens = param_data.make_lens(|param| {
+                    param.normalized_value_to_string(param.unmodulated_normalized_value(), true)
+                });
+                VStack::new(cx, move |cx| {
+                    // Parameter label (top band, centered white, no overlap)
+                    Label::new(cx, param_data.param().name())
+                        .height(Pixels(18.0))
+                        .width(Stretch(1.0))
+                        .font_size(10.0)
+                        .color(Color::rgb(210, 215, 225))
+                        .hoverable(false);
+
+                    Binding::new(cx, Self::expanded, move |cx, expanded| {
+                        if expanded.get(cx) {
+                            VStack::new(cx, move |cx| {
+                                for option in options.iter() {
+                                    Label::new(cx, *option)
+                                        .height(Pixels(16.0))
+                                        .width(Stretch(1.0))
+                                        .font_size(9.0)
+                                        .color(Color::rgb(235, 225, 205))
+                                        .hoverable(false);
+                                }
+                            })
+                            .height(Pixels(16.0 * options.len() as f32))
+                            .width(Stretch(1.0));
+                        } else {
+                            Label::new(cx, display_value_lens.clone())
+                                .height(Pixels(18.0))
+                                .width(Stretch(1.0))
+                                .font_size(10.0)
+                                .color(Color::rgb(230, 185, 50))
+                                .hoverable(false);
+                        }
+                    });
+                })
+                .height(Stretch(1.0))
+                .width(Stretch(1.0));
+            }),
+        )
+        .width(Pixels(94.0))
+        .height(Pixels(64.0))
+    }
+}
+
+impl View for DropdownSelect {
+    fn element(&self) -> Option<&'static str> {
+        Some("dropdown-select")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event, _meta| match window_event {
+            WindowEvent::MouseMove(_x, y) => {
+                self.last_y = *y;
+            }
+            WindowEvent::MouseDown(MouseButton::Left) => {
+                self.param_base.begin_set_parameter(cx);
+                cx.capture();
+                cx.set_active(true);
+                if !self.expanded {
+                    self.expanded = true;
+                } else {
+                    // Determine which option row was clicked from the vertical position.
+                    let bounds = cx.bounds();
+                    let list_top = bounds.y + 18.0;
+                    let row_h = 16.0;
+                    let rel = (self.last_y - list_top) / row_h;
+                    let idx = if rel < 0.0 {
+                        0
+                    } else {
+                        (rel as usize).min(self.options.len().saturating_sub(1))
+                    };
+                    let normalized = if self.options.len() > 1 {
+                        idx as f32 / (self.options.len() - 1) as f32
+                    } else {
+                        0.0
+                    };
+                    self.param_base.set_normalized_value(cx, normalized);
+                    self.expanded = false;
+                    self.param_base.end_set_parameter(cx);
+                    cx.release();
+                    cx.set_active(false);
+                }
+            }
+            WindowEvent::MouseUp(MouseButton::Left) => {
+                if !self.expanded {
+                    self.param_base.end_set_parameter(cx);
+                    cx.release();
+                    cx.set_active(false);
+                }
+            }
+            _ => {}
+        });
+    }
+}
+
 pub struct ChannelMeterView {
     telemetry: Arc<GuiTelemetry>,
     is_output: bool,
