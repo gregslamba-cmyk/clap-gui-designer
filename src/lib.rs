@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `greg_gui_core` - Libreria GUI comune leggera e multipiattaforma (`nih_plug_vizia` + FemtoVG)
 //! Implementa il layout standardizzato di `GUI_SPEC.md` con zero allocazioni sul thread DSP.
 
