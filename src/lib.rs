@@ -1,6 +1,13 @@
 //! `greg_gui_core` - Libreria GUI comune leggera e multipiattaforma (`nih_plug_vizia` + FemtoVG)
 //! Implementa il layout standardizzato di `GUI_SPEC.md` con zero allocazioni sul thread DSP.
 
+#![allow(
+    clippy::clone_on_copy,
+    clippy::collapsible_match,
+    clippy::needless_borrows_for_generic_args,
+    clippy::unnecessary_cast,
+)]
+
 mod gui_tokens;
 
 use nih_plug::prelude::*;
@@ -34,7 +41,6 @@ impl KnobSize {
 }
 
 /// Standard UI metrics.
-
 use gui_tokens::colours;
 use gui_tokens::metrics;
 

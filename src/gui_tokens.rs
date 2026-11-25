@@ -19,7 +19,10 @@ pub mod metrics {
     pub const GUTTER:        f32 = 10.0;
 
     /// Knob visual diameters (px) per `KnobSize`.
+    #[allow(dead_code)]
     pub const KNOB_SIZE_LARGE: f32 = 64.0;
+    #[allow(dead_code)]
     pub const KNOB_SIZE_MEDIUM: f32 = 48.0;
+    #[allow(dead_code)]
     pub const KNOB_SIZE_SMALL: f32 = 36.0;
 }
