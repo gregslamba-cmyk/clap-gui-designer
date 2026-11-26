@@ -21,7 +21,9 @@ use nih_plug_vizia::widgets::util::ModifiersExt;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::path::PathBuf;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::OnceLock;
 
 /// Hardware knob visual sizing (per `GUI_SPEC.md` v2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,17 +122,194 @@ impl GuiTelemetry {
     }
 }
 
+/// Creates a static slice of `ParamDef` from a vector, using `OnceLock` for one-time initialization.
+/// The `OnceLock` is shared across all callers within the same crate context — use the
+/// [`greg_static_params!`] macro for per-plugin isolated `OnceLock` instances.
+pub fn static_param_defs(defs: Vec<ParamDef>) -> &'static [ParamDef] {
+    static LOCK: OnceLock<Vec<ParamDef>> = OnceLock::new();
+    LOCK.get_or_init(|| defs).as_slice()
+}
+
+/// Macro exports per-plugin isolated `OnceLock<Vec<ParamDef>>` statics.
+/// Each invocation generates a distinct `static` item, so every plugin gets its own lock.
+#[macro_export]
+macro_rules! greg_static_params {
+    ($expr:expr) => {{
+        static LOCK: std::sync::OnceLock<Vec<$crate::ParamDef>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| $expr).as_slice()
+    }};
+}
+
+/// A per-parameter accessor for the universal toolbar (A/B Compare, Copy/Paste, Save Default, Preset Browser).
+/// Plugins register these alongside their `ParamDef` entries so the toolbar can snapshot/restore values.
+pub struct ParamAccess {
+    /// Human-readable identifier (the param `#[id = "..."]` string, or the label).
+    pub id: &'static str,
+    /// Reads the current normalized value `[0.0..1.0]` from the plugin's params.
+    pub read: Box<dyn Fn() -> f32 + Send + Sync>,
+    /// Applies a normalized value through the GUI event context (host automation).
+    pub apply: Box<dyn Fn(&mut EventContext, f32) + Send + Sync>,
+}
+
+/// Declarative macro to register `ParamAccess` entries for a plugin's parameter list.
+/// Usage: `greg_param_access!(params, [ ("drive", drive_db), ("mix", mix) ])`
+#[macro_export]
+macro_rules! greg_param_access {
+    ($params:expr, [ $( ($id:literal, $field:ident) ),* $(,)? ]) => {{
+        vec![
+            $( $crate::ParamAccess {
+                id: $id,
+                read: { let p = $params.clone(); Box::new(move || p.$field.unmodulated_normalized_value()) },
+                apply: { let p = $params.clone(); Box::new(move |cx, n| {
+                    let setter = ::nih_plug::prelude::ParamSetter::new(cx);
+                    setter.begin_set_parameter(&p.$field);
+                    setter.set_parameter_normalized(&p.$field, n);
+                    setter.end_set_parameter(&p.$field);
+                }) },
+            } ),*
+        ]
+    }};
+}
+
+/// Serializable snapshot of a plugin's parameters keyed by param id → normalized value.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbSnapshot {
+    pub values: Vec<(String, f32)>,
+}
+
+impl AbSnapshot {
+    /// Capture current normalized values from the parameter access list.
+    pub fn capture(access: &[ParamAccess]) -> Self {
+        let mut values = Vec::with_capacity(access.len());
+        for acc in access {
+            values.push((acc.id.to_string(), (acc.read)()));
+        }
+        values.sort_by(|a, b| a.0.cmp(&b.0));
+        Self { values }
+    }
+
+    /// Restore normalized values through the GUI event context.
+    pub fn restore(&self, cx: &mut EventContext, access: &[ParamAccess]) {
+        for acc in access {
+            if let Some((_, v)) = self.values.iter().find(|(id, _)| id == acc.id) {
+                (acc.apply)(cx, *v);
+            }
+        }
+    }
+}
+
+/// Persistent state for the universal toolbar (A/B Compare + preset directory index).
+#[derive(Debug)]
+pub struct ToolbarState {
+    /// Two in-memory A/B snapshots.
+    pub ab_slots: [Option<AbSnapshot>; 2],
+    /// Currently active slot (0 = A, 1 = B).
+    pub ab_active: usize,
+    /// Plugin identifier used for default/preset file paths.
+    pub plugin_id: String,
+    /// Last preset list directory listing (kept in-memory).
+    pub preset_names: Vec<String>,
+    /// Selected preset index in `preset_names`.
+    pub preset_index: usize,
+}
+
+impl ToolbarState {
+    pub fn new(plugin_id: &str) -> Self {
+        Self {
+            ab_slots: [None, None],
+            ab_active: 0,
+            plugin_id: plugin_id.to_string(),
+            preset_names: Vec::new(),
+            preset_index: 0,
+        }
+    }
+}
+
+/// Path for the shared parameter clipboard: `~/.cache/analog-vibe/param_clipboard.json`.
+pub fn param_clipboard_path() -> PathBuf {
+    home_cache_dir().join("analog-vibe/param_clipboard.json")
+}
+
+/// Path for a plugin's user default state: `~/.config/analog-vibe/<plugin_id>.json`.
+pub fn default_state_path(plugin_id: &str) -> PathBuf {
+    home_config_dir().join(format!("analog-vibe/{plugin_id}.json"))
+}
+
+/// Directory for a plugin's presets: `~/.config/analog-vibe/presets/<plugin_id>/`.
+pub fn presets_dir(plugin_id: &str) -> PathBuf {
+    home_config_dir().join(format!("analog-vibe/presets/{plugin_id}"))
+}
+
+/// `~/.cache` directory (creating it if missing).
+fn home_cache_dir() -> PathBuf {
+    let base = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let p = PathBuf::from(base).join(".cache");
+    let _ = std::fs::create_dir_all(&p);
+    p
+}
+
+/// `~/.config` directory (creating it if missing).
+fn home_config_dir() -> PathBuf {
+    let base = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let p = PathBuf::from(base).join(".config");
+    let _ = std::fs::create_dir_all(&p);
+    p
+}
+
+/// List available preset file names for a plugin (without extension).
+pub fn list_presets(plugin_id: &str) -> Vec<String> {
+    let dir = presets_dir(plugin_id);
+    let mut out = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(dir) {
+        for entry in read_dir.flatten() {
+            if let Some(ext) = entry.path().extension() {
+                if ext == "json" {
+                    if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                        out.push(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+// ============================================================================
+// Model & events
+// ============================================================================
+
 #[derive(Lens)]
 pub struct GregGuiData {
     pub plugin_title: String,
     pub advanced_open: bool,
     pub telemetry: Arc<GuiTelemetry>,
+    /// Universal toolbar state.
+    pub toolbar: ToolbarState,
+    /// Parameter accessors used by the toolbar for snapshot/restore.
+    pub param_access: &'static [ParamAccess],
 }
 
 #[derive(Debug, Clone)]
 pub enum GregGuiEvent {
     ToggleAdvanced,
     ResetClips,
+    /// Toggle snapshot into slot `slot` (0=A, 1=B).
+    AbSlot(usize),
+    /// Restore snapshot from slot `slot`.
+    AbRecall(usize),
+    /// Copy current params to shared clipboard.
+    CopyParams,
+    /// Paste clipboard params into this instance.
+    PasteParams,
+    /// Save user default state file.
+    SaveDefault,
+    /// Select previous preset.
+    PresetPrev,
+    /// Select next preset.
+    PresetNext,
+    /// Save current state as a named preset (text payload in `event.data` string).
+    SavePreset(String),
 }
 
 impl Model for GregGuiData {
@@ -150,7 +329,91 @@ impl Model for GregGuiData {
                     self.telemetry.out_clip[ch].store(false, Ordering::Relaxed);
                 }
             }
+            GregGuiEvent::AbSlot(ref slot) => {
+                self.toolbar.ab_slots[*slot] = Some(AbSnapshot::capture(&self.param_access));
+                self.toolbar.ab_active = *slot;
+            }
+            GregGuiEvent::AbRecall(ref slot) => {
+                if let Some(snap) = &self.toolbar.ab_slots[*slot] {
+                    snap.restore(cx, &self.param_access);
+                    self.toolbar.ab_active = *slot;
+                }
+            }
+            GregGuiEvent::CopyParams => {
+                let _ = self.write_clipboard();
+            }
+            GregGuiEvent::PasteParams => {
+                let _ = self.read_clipboard(cx);
+            }
+            GregGuiEvent::SaveDefault => {
+                let _ = self.save_default();
+            }
+            GregGuiEvent::PresetPrev => {
+                let n = self.toolbar.preset_names.len();
+                if n > 0 {
+                    self.toolbar.preset_index = (self.toolbar.preset_index + n - 1) % n;
+                }
+            }
+            GregGuiEvent::PresetNext => {
+                let n = self.toolbar.preset_names.len();
+                if n > 0 {
+                    self.toolbar.preset_index = (self.toolbar.preset_index + 1) % n;
+                }
+            }
+            GregGuiEvent::SavePreset(ref name) => {
+                let _ = self.save_preset(name);
+            }
         });
+    }
+}
+
+impl GregGuiData {
+    /// Write current parameter state as JSON to the clipboard file.
+    pub fn write_clipboard(&self) -> std::io::Result<()> {
+        let snap = AbSnapshot::capture(&self.param_access);
+        let json = serde_json::to_string_pretty(&snap).unwrap_or_default();
+        if let Some(parent) = param_clipboard_path().parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(param_clipboard_path(), json)
+    }
+
+    /// Read clipboard JSON and restore param values through the GUI context.
+    pub fn read_clipboard(&mut self, cx: &mut EventContext) -> std::io::Result<()> {
+        let content = std::fs::read_to_string(param_clipboard_path())?;
+        if let Ok(snap) = serde_json::from_str::<AbSnapshot>(&content) {
+            snap.restore(cx, &self.param_access);
+        }
+        Ok(())
+    }
+
+    /// Save current state as the user default for this plugin.
+    pub fn save_default(&mut self) -> std::io::Result<()> {
+        let snap = AbSnapshot::capture(&self.param_access);
+        let json = serde_json::to_string_pretty(&snap).unwrap_or_default();
+        let path = default_state_path(&self.toolbar.plugin_id);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, json)
+    }
+
+    /// Save current state as a named preset file.
+    pub fn save_preset(&mut self, name: &str) -> std::io::Result<()> {
+        let snap = AbSnapshot::capture(&self.param_access);
+        let dir = presets_dir(&self.toolbar.plugin_id);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.json"));
+        let json = serde_json::to_string_pretty(&snap).unwrap_or_default();
+        std::fs::write(path, json)?;
+        // Refresh preset list
+        self.toolbar.preset_names = list_presets(&self.toolbar.plugin_id);
+        Ok(())
+    }
+
+    /// Return the normalized read of param `id`, if registered.
+    pub fn param_value(&self, id: &str) -> Option<f32> {
+        self.param_access.iter().find(|a| a.id == id).map(|a| (a.read)())
     }
 }
 
@@ -330,6 +593,74 @@ impl View for RotaryKnob {
             &path,
             &Paint::color(Color::rgb(colours::TEXT[0], colours::TEXT[1], colours::TEXT[2]).into()),
         );
+    }
+}
+
+/// Hardware rotary knob optimized for bipolar parameters (e.g. Gain, Pan) that map
+/// `0.5` to the centered `0°` position on the dial (12 o'clock).
+#[derive(Lens)]
+pub struct BipolarKnob {
+    param_base: ParamWidgetBase,
+    drag_active: bool,
+    drag_start_y: f32,
+    drag_start_norm: f32,
+    last_norm: f32,
+}
+
+impl BipolarKnob {
+    pub fn new<L, Params, P, FMap>(
+        cx: &mut Context,
+        params: L,
+        params_to_param: FMap,
+    ) -> Handle<'_, BipolarKnob>
+    where
+        L: Lens<Target = Params> + Clone,
+        Params: 'static,
+        P: Param + 'static,
+        FMap: Fn(&Params) -> &P + Copy + 'static,
+    {
+        Self {
+            param_base: ParamWidgetBase::new(cx, params, params_to_param),
+            drag_active: false,
+            drag_start_y: 0.0,
+            drag_start_norm: 0.0,
+            last_norm: 0.0,
+        }
+        .build(
+            cx,
+            ParamWidgetBase::build_view(params, params_to_param, move |cx, param_data| {
+                let display_value_lens = param_data.make_lens(|param| {
+                    param.normalized_value_to_string(param.unmodulated_normalized_value(), true)
+                });
+                VStack::new(cx, |cx| {
+                    Label::new(cx, param_data.param().name())
+                        .height(Pixels(18.0))
+                        .width(Stretch(1.0))
+                        .font_size(10.0)
+                        .color(Color::rgb(210, 215, 225))
+                        .hoverable(false);
+                    Label::new(cx, "")
+                        .height(Stretch(1.0))
+                        .hoverable(false);
+                    Label::new(cx, display_value_lens)
+                        .height(Pixels(18.0))
+                        .width(Stretch(1.0))
+                        .font_size(10.0)
+                        .color(Color::rgb(230, 185, 50))
+                        .hoverable(false);
+                })
+                .height(Stretch(1.0))
+                .width(Stretch(1.0));
+            }),
+        )
+        .width(Pixels(metrics::KNOB_W))
+        .height(Pixels(metrics::KNOB_H))
+    }
+}
+
+impl View for BipolarKnob {
+    fn element(&self) -> Option<&'static str> {
+        Some("bipolar-knob")
     }
 }
 
@@ -923,6 +1254,8 @@ pub fn create_fallback_editor(
             plugin_title: title_str.clone(),
             advanced_open: false,
             telemetry: telemetry_clone.clone(),
+            toolbar: ToolbarState::new(title_str.as_str()),
+            param_access: &[],
         }
         .build(cx);
 
@@ -1001,6 +1334,9 @@ pub fn create_fallback_editor(
 }
 
 /// Extended version with an optional auto-generated parameter grid.
+/// Backwards-compatible 6-arg entry point: delegates with an empty parameter-access list
+/// (the universal toolbar is rendered but A/B/clipboard operations are inert until a plugin
+/// registers [`ParamAccess`] entries through [`create_greg_editor_full`]).
 pub fn create_greg_editor_with_params<M, A, MB>(
     title: &'static str,
     telemetry: Arc<GuiTelemetry>,
@@ -1008,6 +1344,33 @@ pub fn create_greg_editor_with_params<M, A, MB>(
     advanced_builder: A,
     param_defs: Option<&'static [ParamDef]>,
     model_builder: MB,
+) -> Option<Box<dyn Editor>>
+where
+    M: Fn(&mut Context) + 'static + Send + Sync,
+    A: Fn(&mut Context) + 'static + Send + Sync,
+    MB: Fn(&mut Context) + 'static + Send + Sync,
+{
+    create_greg_editor_full(
+        title,
+        telemetry,
+        main_builder,
+        advanced_builder,
+        param_defs,
+        model_builder,
+        &[] as &[ParamAccess],
+    )
+}
+
+/// Full entry point that also registers per-parameter accessors so the universal toolbar
+/// (A/B Compare, Copy/Paste, Save Default, Preset Browser) is fully functional.
+pub fn create_greg_editor_full<M, A, MB>(
+    title: &'static str,
+    telemetry: Arc<GuiTelemetry>,
+    main_builder: M,
+    advanced_builder: A,
+    param_defs: Option<&'static [ParamDef]>,
+    model_builder: MB,
+    param_access: &'static [ParamAccess],
 ) -> Option<Box<dyn Editor>>
 where
     M: Fn(&mut Context) + 'static + Send + Sync,
@@ -1035,7 +1398,14 @@ where
             model_builder(cx);
             assets::register_noto_sans_regular(cx);
             assets::register_noto_sans_bold(cx);
-            GregGuiData { plugin_title: title_str.clone(), advanced_open: false, telemetry: telemetry.clone() }.build(cx);
+            GregGuiData {
+                plugin_title: title_str.clone(),
+                advanced_open: false,
+                telemetry: telemetry.clone(),
+                toolbar: ToolbarState::new(&title_str),
+                param_access,
+            }
+            .build(cx);
             let tel_out = telemetry.clone();
             let tel_in = telemetry.clone();
             let tel_foot = telemetry.clone();
@@ -1045,6 +1415,20 @@ where
                 HStack::new(cx, |cx| {
                     Label::new(cx, GregGuiData::plugin_title).font_size(15.0).font_weight(FontWeightKeyword::Bold).color(Color::rgb(235, 225, 205)).left(Pixels(12.0));
                     Element::new(cx).width(Stretch(1.0));
+                    // A/B Compare buttons
+                    Button::new(cx, |cx| cx.emit(GregGuiEvent::AbSlot(0)), |cx| Label::new(cx, "A")).right(Pixels(4.0));
+                    Button::new(cx, |cx| cx.emit(GregGuiEvent::AbSlot(1)), |cx| Label::new(cx, "B")).right(Pixels(4.0));
+                    Button::new(cx, |cx| cx.emit(GregGuiEvent::AbRecall(0)), |cx| Label::new(cx, "<A")).right(Pixels(4.0));
+                    Button::new(cx, |cx| cx.emit(GregGuiEvent::AbRecall(1)), |cx| Label::new(cx, "<B")).right(Pixels(4.0));
+                    // Copy / Paste
+                    Button::new(cx, |cx| cx.emit(GregGuiEvent::CopyParams), |cx| Label::new(cx, "Copy")).right(Pixels(4.0));
+                    Button::new(cx, |cx| cx.emit(GregGuiEvent::PasteParams), |cx| Label::new(cx, "Paste")).right(Pixels(4.0));
+                    // Save Default
+                    Button::new(cx, |cx| cx.emit(GregGuiEvent::SaveDefault), |cx| Label::new(cx, "Save Def")).right(Pixels(4.0));
+                    // Preset nav < > and label
+                    Button::new(cx, |cx| cx.emit(GregGuiEvent::PresetPrev), |cx| Label::new(cx, "<")).right(Pixels(2.0));
+                    Label::new(cx, "Presets").font_size(11.0).right(Pixels(2.0));
+                    Button::new(cx, |cx| cx.emit(GregGuiEvent::PresetNext), |cx| Label::new(cx, ">")).right(Pixels(4.0));
                     Button::new(cx, |cx| cx.emit(GregGuiEvent::ToggleAdvanced), |cx| Label::new(cx, GregGuiData::advanced_open.map(|o| if *o { "- ADV" } else { "+ ADV" }))).right(Pixels(12.0));
                 }).height(Pixels(38.0)).background_color(Color::rgb(24, 26, 30)).child_top(Stretch(1.0)).child_bottom(Stretch(1.0));
                 HStack::new(cx, move |cx| {
